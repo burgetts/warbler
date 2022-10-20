@@ -4,8 +4,8 @@ from flask import Flask, render_template, request, flash, redirect, session, g
 from flask_debugtoolbar import DebugToolbarExtension
 from sqlalchemy.exc import IntegrityError
 
-from forms import UserAddForm, LoginForm, MessageForm
-from models import db, connect_db, User, Message
+from forms import UserAddForm, LoginForm, MessageForm, UserEditForm
+from models import db, connect_db, User, Message, Likes
 
 CURR_USER_KEY = "curr_user"
 
@@ -19,9 +19,9 @@ app.config['SQLALCHEMY_DATABASE_URI'] = (
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ECHO'] = False
-app.config['DEBUG_TB_INTERCEPT_REDIRECTS'] = True
+#app.config['DEBUG_TB_INTERCEPT_REDIRECTS'] = True
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', "it's a secret")
-toolbar = DebugToolbarExtension(app)
+#toolbar = DebugToolbarExtension(app)
 
 connect_db(app)
 
@@ -95,7 +95,6 @@ def login():
     """Handle user login."""
 
     form = LoginForm()
-
     if form.validate_on_submit():
         user = User.authenticate(form.username.data,
                                  form.password.data)
@@ -113,8 +112,9 @@ def login():
 @app.route('/logout')
 def logout():
     """Handle logout of user."""
-
-    # IMPLEMENT THIS
+    do_logout()
+    flash("You've been logged out.")
+    return redirect('/login')
 
 
 ##############################################################################
@@ -143,6 +143,7 @@ def users_show(user_id):
 
     user = User.query.get_or_404(user_id)
 
+    num_likes = len(user.likes)
     # snagging messages in order from the database;
     # user.messages won't be in order by default
     messages = (Message
@@ -151,7 +152,7 @@ def users_show(user_id):
                 .order_by(Message.timestamp.desc())
                 .limit(100)
                 .all())
-    return render_template('users/show.html', user=user, messages=messages)
+    return render_template('users/show.html', user=user, messages=messages, num_likes=num_likes)
 
 
 @app.route('/users/<int:user_id>/following')
@@ -176,6 +177,13 @@ def users_followers(user_id):
 
     user = User.query.get_or_404(user_id)
     return render_template('users/followers.html', user=user)
+
+@app.route('/users/<int:user_id>/likes')
+def show_liked_messages(user_id):
+    """Show user's liked messages."""
+    user = User.query.get_or_404(user_id)
+    likes = user.likes
+    return render_template('/users/likes.html', likes=likes)
 
 
 @app.route('/users/follow/<int:follow_id>', methods=['POST'])
@@ -211,8 +219,26 @@ def stop_following(follow_id):
 @app.route('/users/profile', methods=["GET", "POST"])
 def profile():
     """Update profile for current user."""
-
-    # IMPLEMENT THIS
+    if not g.user:
+        flash("Access unauthorized.", "danger")
+        return redirect("/")
+    form = UserEditForm(obj=g.user)
+    if form.validate_on_submit():
+        username = g.user.username
+        user = User.authenticate(username,
+                                form.password.data)
+        if user: 
+            user.username = form.username.data
+            user.email = form.email.data
+            user.image_url = form.image_url.data
+            user.header_image_url = form.header_image_url.data
+            user.bio = form.bio.data
+            db.session.add(user)
+            db.session.commit()
+            return redirect(f'/users/{user.id}')
+        else: 
+            flash("Wrong password", "danger")
+    return render_template('/users/edit.html', form=form)
 
 
 @app.route('/users/delete', methods=["POST"])
@@ -260,6 +286,9 @@ def messages_add():
 @app.route('/messages/<int:message_id>', methods=["GET"])
 def messages_show(message_id):
     """Show a message."""
+    if not g.user:
+        flash("Access unauthorized.", "danger")
+        return redirect("/")
 
     msg = Message.query.get(message_id)
     return render_template('messages/show.html', message=msg)
@@ -279,6 +308,36 @@ def messages_destroy(message_id):
 
     return redirect(f"/users/{g.user.id}")
 
+##############################################################################
+# Like routes:
+
+@app.route('/users/add_like/<msg_id>', methods=["GET","POST"])
+def add_like(msg_id):
+    """Like a message."""
+
+    if not g.user:
+        flash("Access unauthorized.", "danger")
+        return redirect("/")
+
+    msg_id = int(msg_id)
+    liked_messages_ids = [l.id for l in g.user.likes]
+    
+    message = Message.query.get_or_404(msg_id)
+    poster_id = message.user.id
+
+    if poster_id == g.user.id:
+        return redirect('/')
+
+    if msg_id in liked_messages_ids:
+        like = Likes.query.filter(Likes.user_id == g.user.id).filter(Likes.message_id == msg_id).first()
+        db.session.delete(like)
+        db.session.commit()
+        return redirect('/')
+
+    new_like = Likes(user_id=g.user.id, message_id=msg_id)
+    db.session.add(new_like)
+    db.session.commit()
+    return redirect('/')
 
 ##############################################################################
 # Homepage and error pages
@@ -293,13 +352,18 @@ def homepage():
     """
 
     if g.user:
+
+        following_ids = [u.id for u in g.user.following] + [g.user.id]
+        liked_messages_ids = [l.id for l in g.user.likes]
+  
         messages = (Message
                     .query
+                    .filter(Message.user_id.in_(following_ids))
                     .order_by(Message.timestamp.desc())
                     .limit(100)
                     .all())
-
-        return render_template('home.html', messages=messages)
+        # want only messages where user_id in following.user_id
+        return render_template('home.html', messages=messages, liked_msgs = liked_messages_ids)
 
     else:
         return render_template('home-anon.html')
